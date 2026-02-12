@@ -1,105 +1,64 @@
 import fitz  # PyMuPDF
-import cv2   # OpenCV
 import numpy as np
+import cv2
 import io
 
-def generate_feathered_mask(shape, padding_x, padding_y, blur_radius):
-    """
-    生成一个边缘柔和羽化的 Alpha 遮罩。
-    中心区域白色（不透明），边缘逐渐过渡到黑色（透明）。
-    """
-    h, w = shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    # 绘制中心白色矩形，留出羽化边距
-    cv2.rectangle(mask, (padding_x, padding_y), (w - padding_x, h - padding_y), (255), -1)
-    # 使用高斯模糊制造柔和边界
-    # blur_radius 越大，边界越模糊，融合越好
-    feathered_mask = cv2.GaussianBlur(mask, (blur_radius, blur_radius), 0)
-    return feathered_mask
-
-def ultimate_seamless_replace(pdf_path, output_path, start_x, start_y):
+def four_way_gradient_replace(pdf_path, output_path, start_x, start_y):
     doc = fitz.open(pdf_path)
-    
-    # --- 精确的目标数据 ---
-    target_w = 100
-    target_h = 15
-    
-    # --- 关键参数调优 ---
-    # 1. 上下文范围：向外扩展多少像素用于采样背景和融合
-    # 范围越大，渐变过渡越自然，建议 10-20
-    context_margin = 15 
-    
-    # 2. 羽化半径：控制边界的模糊程度。必须是奇数。
-    # 越大边界越不可见，但太大会导致中心遮盖力下降。建议 11-21。
-    feather_blur = 15 
-    
-    # 定义包含周围环境的大区域
-    context_rect = fitz.Rect(start_x - context_margin, start_y - context_margin, 
-                             start_x + target_w + context_margin, start_y + target_h + context_margin)
+    width, height = 105, 15  # 你的目标尺寸
 
-    print(f"启动终极融合引擎。处理文档共 {len(doc)} 页...")
-
-    for page_num, page in enumerate(doc):
-        # --- 步骤 1: 高清采集上下文环境 ---
-        # 使用 2 倍缩放采集，保证纹理细节
-        zoom = 2
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=context_rect)
-        img_bgra = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-        img_bgr = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2BGR)
+    for page in doc:
+        # 1. 采样：取一个比目标大 1 像素的框，为了抓取 4 条边的原生颜色
+        sample_rect = fitz.Rect(start_x - 1, start_y - 1, start_x + width + 1, start_y + height + 1)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=sample_rect)
         
-        # --- 步骤 2: 制造完美的“干净基底” (Inpainting) ---
-        # 创建修复蒙版
-        inpaint_mask = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
-        # 计算需要擦除的水印区域在高清图中的坐标
-        mx1 = int((context_margin) * zoom)
-        my1 = int((context_margin) * zoom)
-        mx2 = int((context_margin + target_w) * zoom)
-        my2 = int((context_margin + target_h) * zoom)
-        # 稍微内缩一点点，确保不误伤外部纹理
-        cv2.rectangle(inpaint_mask, (mx1+2, my1+2), (mx2-2, my2-2), (255), -1)
+        # 转换为 numpy (RGB 格式，确保不偏色)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
         
-        # 使用 Navier-Stokes 算法进行修复 (比 Telea 通常更平滑，适合渐变背景)
-        clean_base_bgr = cv2.inpaint(img_bgr, inpaint_mask, 3, cv2.INPAINT_NS)
-        clean_base_rgb = cv2.cvtColor(clean_base_bgr, cv2.COLOR_BGR2RGB)
+        # 提取 4 条边界的真实像素值 (在高分辨率 2x 下坐标翻倍)
+        h_img, w_img = img.shape[:2]
+        top_line = img[0, 1:-1].astype(float)
+        bot_line = img[-1, 1:-1].astype(float)
+        lef_line = img[1:-1, 0].astype(float)
+        rig_line = img[1:-1, -1].astype(float)
 
-        # --- 步骤 3: 核心魔法 - 创建柔焦 Alpha 通道 ---
-        # 我们不直接贴这个干净图，而是把它做成一个边缘透明的贴纸
-        
-        # 计算羽化遮罩的内缩边距
-        pad_x = int(context_margin * zoom * 0.5) # 让羽化区只发生在 margin 区域内
-        pad_y = int(context_margin * zoom * 0.5)
-        
-        # 生成柔和的 alpha mask
-        alpha_channel = generate_feathered_mask(clean_base_rgb.shape, pad_x, pad_y, feather_blur)
-        
-        # 合并 RGB 和 Alpha 通道，生成 RGBA 图像
-        r, g, b = cv2.split(clean_base_rgb)
-        rgba_patch = cv2.merge([r, g, b, alpha_channel])
+        # 2. 构造 4 向渐变场
+        # 创建一个空补丁 (内缩回 100x15 的原始比例)
+        rows, cols = h_img - 2, w_img - 2
+        patch = np.zeros((rows, cols, 3), dtype=float)
 
-        # --- 步骤 4: 将柔和贴片融合回 PDF ---
-        # 编码为 PNG 以保留 Alpha 通道
-        is_success, png_buffer = cv2.imencode(".png", rgba_patch)
-        if not is_success: continue
-        png_stream = io.BytesIO(png_buffer)
+        # 使用双线性融合公式：每一像素都是 4 条边的权重贡献
+        for r in range(rows):
+            for c in range(cols):
+                # 计算权重 (0 到 1)
+                u = c / (cols - 1) if cols > 1 else 0.5 # 水平进度
+                v = r / (rows - 1) if rows > 1 else 0.5 # 垂直进度
+                
+                # 水平方向插值结果
+                color_h = (1 - u) * lef_line[r] + u * rig_line[r]
+                # 垂直方向插值结果
+                color_v = (1 - v) * top_line[c] + v * bot_line[c]
+                
+                # 核心：将水平和垂直结果再次融合
+                # 这样消灭了单一方向的“撞车”，让颜色在二维平面平滑过渡
+                patch[r, c] = (color_h + color_v) / 2
 
-        # 插入这个带有柔和边缘的图像。
-        # PDF渲染器会自动处理 Alpha 混合，使边界消失。
-        page.insert_image(context_rect, stream=png_stream.getvalue())
+        # 3. 贴回 PDF
+        final_patch = patch.astype(np.uint8)
+        is_success, buffer = cv2.imencode(".png", cv2.cvtColor(final_patch, cv2.COLOR_RGB2BGR))
+        if is_success:
+            page.insert_image(fitz.Rect(start_x, start_y, start_x + width, start_y + height), 
+                             stream=io.BytesIO(buffer).getvalue())
 
-        # --- 步骤 5: 写入高质量矢量文字 ---
-        my_text = "靖宇"
+        # 4. 写入文字 (靖宇)
+        text = "靖宇乱说"
         f_size, f_name = 15.0, "china-s"
-        text_w = fitz.get_text_length(my_text, fontname=f_name, fontsize=f_size)
-        # 精确居中计算
-        text_x = start_x + (target_w - text_w) / 2
-        text_y = start_y + 13
-        # 确保文字在最上层
-        page.insert_text((text_x, text_y), my_text, fontsize=f_size, fontname=f_name, color=(0, 0, 0), overlay=True)
+        tw = fitz.get_text_length(text, fontname=f_name, fontsize=f_size)
+        page.insert_text((start_x + (width - tw)/2, start_y + 13), 
+                         text, fontsize=f_size, fontname=f_name, color=(0, 0, 0))
 
-    # 使用高压缩保存，并清理冗余数据
-    doc.save(output_path, garbage=4, deflate=True)
-    print(f"终极融合完成。输出文件: {output_path}")
+    doc.save(output_path)
+    print(f"4向梯度填充完成。保存在: final_no_seam.pdf")
 
-# --- 执行 ---
-# 请替换你的文件名
-ultimate_seamless_replace("Family_Pride_Algorithm.pdf", "final_ultimate_output.pdf", 1268, 745)
+# 执行
+four_way_gradient_replace("Family_Pride_Algorithm.pdf", "final_no_seam.pdf", 1265, 745)
