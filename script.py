@@ -3,143 +3,99 @@ import numpy as np
 import cv2
 import io
 
-# --- 核心算法函数：底色重建与纹理注入 ---
-
-def generate_4way_gradient(target_rgb):
+def generate_feathered_alpha(h, w, feather_radius=5):
     """
-    基于目标区域边缘，生成 4 向插值的光滑色彩底色。
+    创建一个边缘柔和羽化的 Alpha 通道蒙版。
     """
-    h, w = target_rgb.shape[:2]
-    img = target_rgb.astype(float)
+    # 初始全白（不透明）
+    mask = np.ones((h, w), dtype=np.float32) * 255
     
-    # 提取四条边界的像素行/列
-    top, bot = img[0, :], img[-1, :]
-    lef, rig = img[:, 0], img[:, -1]
+    # 在边缘绘制黑色矩形，用于生成渐变
+    # 这里的关键是：我们让最外圈彻底透明
+    mask = cv2.copyMakeBorder(mask[feather_radius:-feather_radius, feather_radius:-feather_radius], 
+                               feather_radius, feather_radius, feather_radius, feather_radius, 
+                               cv2.BORDER_CONSTANT, value=0)
+    
+    # 高斯模糊，将黑白边界变成柔和的渐变
+    mask = cv2.GaussianBlur(mask, (feather_radius * 2 + 1, feather_radius * 2 + 1), 0)
+    return mask.astype(np.uint8)
 
-    base = np.zeros((h, w, 3), dtype=float)
-    # 创建坐标网格
-    v_coords = np.linspace(0, 1, h)
-    u_coords = np.linspace(0, 1, w)
-    uu, vv = np.meshgrid(u_coords, v_coords)
-
-    for c in range(3): # 处理 R, G, B 三个通道
-        # 水平插值分量
-        color_h = (1 - uu) * lef[:, c][:, np.newaxis] + uu * rig[:, c][:, np.newaxis]
-        # 垂直插值分量
-        color_v = (1 - vv) * top[:, c][np.newaxis, :] + vv * bot[:, c][np.newaxis, :]
-        # 融合
-        base[:, :, c] = (color_h + color_v) / 2
-    return base
-
-def get_best_texture_source(page, target_rect, zoom=3):
-    """
-    8邻域方差扫描：寻找周围最干净的背景块。
-    """
-    w, h = target_rect.width, target_rect.height
+def ultimate_feathered_replace(pdf_path, start_x, start_y):
+    doc = fitz.open(pdf_path)
+    width, height = 105, 15
+    zoom = 3 # 保持高清采样
     mat = fitz.Matrix(zoom, zoom)
-    gap = 4 # 避开原水印边缘的采样间隙
     
-    # 候选偏移：上、下、左、右及四个斜角
-    candidates = [
-        (0, -h-gap), (0, h+gap), (-w-gap, 0), (w+gap, 0),
-        (-w-gap, -h-gap), (w+gap, -h-gap), (-w-gap, h+gap), (w+gap, h+gap)
-    ]
-    
-    best_img = None
-    min_var = float('inf')
-
-    for dx, dy in candidates:
-        cand_rect = target_rect + (dx, dy, dx, dy)
-        # 边界检查
-        if not (0 <= cand_rect.x0 and cand_rect.x1 <= page.rect.width and 
-                0 <= cand_rect.y0 and cand_rect.y1 <= page.rect.height):
-            continue
-            
-        pix = page.get_pixmap(matrix=mat, clip=cand_rect)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        
-        # 计算方差：方差越小说明越“白净”，没有文字干扰
-        current_var = np.var(gray)
-        if current_var < min_var:
-            min_var = current_var
-            best_img = img
-            
-    return best_img
-
-def apply_texture(smooth_base, texture_src):
-    """
-    高频纹理传递：将参考区的噪点注入到光滑基底。
-    """
-    h, w = smooth_base.shape[:2]
-    # 调整纹理源大小以匹配补丁
-    src_res = cv2.resize(texture_src, (w, h), interpolation=cv2.INTER_CUBIC).astype(float)
-    
-    # 提取高频细节：原图 - 低通滤波图
-    low_freq = cv2.GaussianBlur(src_res, (15, 15), 0)
-    texture_residual = src_res - low_freq
-    
-    # 融合并限幅
-    k = 0.5 # 颗粒感
-    combined = np.clip(smooth_base + k * texture_residual, 0, 255).astype(np.uint8)
-    return combined
-
-# --- 主逻辑：PDF 处理流程 ---
-
-def run_ultimate_replacement(input_pdf, output_pdf, start_x, start_y):
-    doc = fitz.open(input_pdf)
-    width, height = 100, 15
-    zoom = 3 # 纹理采样精度
-    
-    print(f"开始处理 PDF，坐标点: ({start_x}, {start_y})")
+    # 羽化半径：控制边缘融合的宽度（3-5像素效果最好）
+    feather_r = 3 
 
     for i, page in enumerate(doc):
-        # 坐标预检：如果坐标超过页面宽高，发出警告
-        if start_x > page.rect.width or start_y > page.rect.height:
-            print(f"警告：第 {i+1} 页坐标 ({start_x}, {start_y}) 超出页面范围 {page.rect.width}x{page.rect.height}")
-
-        target_rect = fitz.Rect(start_x, start_y, start_x + width, start_y + height)
-
-        # 1. 采集目标位置的边缘梯度信息
-        pix_target = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=target_rect)
-        target_img = np.frombuffer(pix_target.samples, dtype=np.uint8).reshape(pix_target.height, pix_target.width, 3)
-
-        # 2. 自动寻找最佳纹理参考区
-        texture_src = get_best_texture_source(page, target_rect, zoom)
+        # 扩展采样区：为了实现羽化，我们需要采一个比 100x15 稍微大一点的区域
+        # 这样羽化带就能完美衔接外部背景
+        context_rect = fitz.Rect(start_x - feather_r, start_y - feather_r, 
+                                 start_x + width + feather_r, start_y + height + feather_r)
         
-        # 3. 生成底色基底
-        smooth_base = generate_4way_gradient(target_img)
+        # 1. 采集图像
+        pix = page.get_pixmap(matrix=mat, clip=context_rect)
+        img_rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
         
-        # 4. 融合纹理（如果找到了纹理源）
-        if texture_src is not None:
-            final_patch_rgb = apply_texture(smooth_base, texture_src)
-        else:
-            final_patch_rgb = smooth_base.astype(np.uint8)
+        # 2. 生成内部逻辑（4向梯度 + 纹理注入）
+        # 这里直接在 img_rgb 的基础上生成（由于采样了大一圈，边缘更自然）
+        from_v3 = generate_4way_gradient(img_rgb) # 这里复用上一版的函数
+        
+        # 提取纹理（假设取左侧邻域作为纹理源，避免污染）
+        tex_src_rect = fitz.Rect(start_x - width - 5, start_y, start_x - 5, start_y + height)
+        pix_tex = page.get_pixmap(matrix=mat, clip=tex_src_rect)
+        tex_rgb = np.frombuffer(pix_tex.samples, dtype=np.uint8).reshape(pix_tex.height, pix_tex.width, 3)
+        
+        # 融合底色与纹理
+        combined_rgb = apply_texture(from_v3, tex_rgb) # 这里复用上一版的函数
 
-        # 5. 贴回 PDF
-        # 注意：OpenCV 使用 BGR，PyMuPDF/PNG 使用 RGB
-        is_success, buffer = cv2.imencode(".png", cv2.cvtColor(final_patch_rgb, cv2.COLOR_RGB2BGR))
+        # 3. 核心：添加 Alpha 羽化通道
+        h_p, w_p = combined_rgb.shape[:2]
+        alpha = generate_feathered_alpha(h_p, w_p, feather_radius=feather_r * zoom)
+        
+        # 合并为 RGBA
+        r, g, b = cv2.split(combined_rgb)
+        rgba_patch = cv2.merge([r, g, b, alpha])
+
+        # 4. 贴回 PDF (使用 context_rect 确保羽化边缘覆盖到正确位置)
+        is_success, buffer = cv2.imencode(".png", cv2.cvtColor(rgba_patch, cv2.COLOR_RGBA2BGRA))
         if is_success:
-            page.insert_image(target_rect, stream=io.BytesIO(buffer).getvalue())
+            page.insert_image(context_rect, stream=io.BytesIO(buffer).getvalue())
 
-        # 6. 插入文字 (靖宇)
-        text_to_add = "靖宇"
-        font_size = 15.0
-        # 使用内置宋体风格
-        tw = fitz.get_text_length(text_to_add, fontname="china-s", fontsize=font_size)
+        # 5. 写入文字
+        text = "靖宇"
+        tw = fitz.get_text_length(text, fontname="china-s", fontsize=15.0)
+        page.insert_text((start_x + (width - tw)/2, start_y + 13), text, 
+                         fontsize=15.0, fontname="china-s", color=(0, 0, 0))
         
-        # 精确居中计算
-        text_x = start_x + (width - tw) / 2
-        text_y = start_y + 13 # 15高度下的经验视觉基线
-        
-        page.insert_text((text_x, text_y), text_to_add, 
-                         fontsize=font_size, fontname="china-s", color=(0, 0, 0))
+    name = pdf_path.rsplit(".pdf", 1)[0]
+    output_path = f"{name}_{text}.pdf"
+    doc.save(output_path, garbage=4, deflate=True)
+    print(f"羽化融合完成，边界感已消除: {output_path}")
 
-    doc.save(output_pdf, garbage=4, deflate=True)
-    doc.close()
-    print(f"处理成功！输出文件: {output_pdf}")
+# --- 辅助函数：确保代码完整可运行 ---
+def generate_4way_gradient(img_rgb):
+    h, w = img_rgb.shape[:2]
+    img = img_rgb.astype(float)
+    top, bot, lef, rig = img[0,:], img[-1,:], img[:,0], img[:,-1]
+    base = np.zeros((h, w, 3), dtype=float)
+    v_coords, u_coords = np.linspace(0, 1, h), np.linspace(0, 1, w)
+    uu, vv = np.meshgrid(u_coords, v_coords)
+    for c in range(3):
+        ch = (1-uu)*lef[:,c][:,np.newaxis] + uu*rig[:,c][:,np.newaxis]
+        cv = (1-vv)*top[:,c][np.newaxis,:] + vv*bot[:,c][np.newaxis,:]
+        base[:,:,c] = (ch + cv) / 2
+    return base
 
-# --- 执行入口 ---
-if __name__ == "__main__":
-    # 请确保文件名正确
-    run_ultimate_replacement("Family_Pride_Algorithm.pdf", "final_output_perfect.pdf", 1268, 745)
+def apply_texture(smooth_base, texture_src):
+    h, w = smooth_base.shape[:2]
+    src_res = cv2.resize(texture_src, (w, h), interpolation=cv2.INTER_CUBIC).astype(float)
+    low_freq = cv2.GaussianBlur(src_res, (15, 15), 0)
+    texture_residual = src_res - low_freq
+    k = 0.4 # noise
+    return np.clip(smooth_base + k * texture_residual, 0, 255).astype(np.uint8)
+
+# 执行
+ultimate_feathered_replace("GeoFlow_Precision_Visualization.pdf", 1265, 746)
