@@ -121,7 +121,7 @@ def ultimate_adaptive_replace(pdf_path, start_x, start_y):
                          fontsize=15.0, fontname="china-s", color=(0, 0, 0))
 
     name_base = pdf_path.rsplit(".pdf", 1)[0]
-    output_path = f"{name_base}_fixed.pdf"
+    output_path = f"{name_base}_{replace_text[:2]}.pdf"
     doc.save(output_path, garbage=4, deflate=True)
     doc.close()
     print(f"自适应处理完成: {output_path}")
